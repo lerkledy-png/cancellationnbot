@@ -1,5 +1,11 @@
 {
+    "name": "ticket-annul-bot",
+    "version": "1.0.0",
+    "main": "index.js",
     "type": "module",
+    "scripts": {
+        "start": "node index.js"
+    },
     "dependencies": {
         "dotenv": "^16.6.1",
         "google-auth-library": "^10.5.0",
