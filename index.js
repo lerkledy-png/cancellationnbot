@@ -16,22 +16,36 @@ const {
   BOT_TOKEN,
   SHEET_ID,
   APPROVERS = '',
-  REQUIRED_APPROVALS = '1', // по умолчанию 1
+  REQUIRED_APPROVALS = '1', // по умолчанию один голос
 } = process.env;
 
-if (!BOT_TOKEN) throw new Error('BOT_TOKEN отсутствует в .env');
-if (!SHEET_ID) throw new Error('SHEET_ID отсутствует в .env');
+if (!BOT_TOKEN) throw new Error('BOT_TOKEN отсутствует в .env/Environment');
+if (!SHEET_ID) throw new Error('SHEET_ID отсутствует в .env/Environment');
 
 // ---------- 2) Google Sheets Auth ----------
-const creds = JSON.parse(fs.readFileSync(path.join(__dirname, 'credentials.json'), 'utf8'));
+// Берём ключ либо из переменной среды GOOGLE_CREDS (Render), либо из локального файла credentials.json
+let rawCreds;
+try {
+  if (process.env.GOOGLE_CREDS && process.env.GOOGLE_CREDS.trim().startsWith('{')) {
+    rawCreds = JSON.parse(process.env.GOOGLE_CREDS);
+  } else {
+    const p = path.join(__dirname, 'credentials.json');
+    rawCreds = JSON.parse(fs.readFileSync(p, 'utf8'));
+  }
+} catch (e) {
+  console.error('❌ Не удалось прочитать GOOGLE_CREDS/credentials.json:', e?.message || e);
+  throw e;
+}
+
 const auth = new JWT({
-  email: creds.client_email,
-  key: creds.private_key,
+  email: rawCreds.client_email,
+  key: rawCreds.private_key,
   scopes: [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive',
   ],
 });
+
 const doc = new GoogleSpreadsheet(SHEET_ID, auth);
 await doc.loadInfo();
 console.log('✅ Подключено к Google Sheet:', doc.title);
@@ -50,7 +64,6 @@ const fullName = u => [u.first_name, u.last_name].filter(Boolean).join(' ') || '
 const mentionByProfile = u => (u.username ? `@${u.username}` : `<a href="tg://user?id=${u.id}">${fullName(u)}</a>`);
 const mentionApproversLine = () =>
   APPROVER_LIST.length ? `Утверждающие: ${APPROVER_LIST.map(u => `@${u}`).join(', ')}` : '';
-
 const needFooterLine = () => (REQUIRED === 1 ? 'Нужно одобрение: 1' : `Нужно одобрений: ${REQUIRED}`);
 
 const nowHelsinkiString = () =>
@@ -138,7 +151,7 @@ function formatAmount(n) {
 const ticketsState = new Map();
 const pendingComments = new Map();
 
-// ---------- 5) /анн — шаблон (с «Сумма») ----------
+// ---------- 5) /анн — выдаёт шаблон ----------
 bot.onText(/^\/(?:анн|ann|a)(?:@[\w_]+)?(?:\s+|$)/i, async (msg) => {
   const chatId = msg.chat.id;
   const userName = msg.from.first_name || msg.from.username || 'коллега';
@@ -167,8 +180,8 @@ function parsePayload(text) {
   const ticket    = grab('Тикет');
   const violation = grab('Нарушение');
   const reason    = grab('Причина');
-  const amount    = grab('Сумма');     // опционально
-  const operator  = grab('Оператор');  // опционально
+  const amount    = grab('Сумма');
+  const operator  = grab('Оператор');
   if (!ticket || !violation || !reason) return null;
   return { ticket, violation, reason, amount, operator };
 }
@@ -262,7 +275,7 @@ bot.on('callback_query', async (query) => {
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML' }
     );
 
-    // кворум = REQUIRED (по .env); при 1 — сразу пишем строку
+    // кворум достигнут — пишем в таблицу
     if (st.approvals.size >= REQUIRED) {
       st.resolved = true;
       try {
@@ -309,7 +322,7 @@ bot.on('callback_query', async (query) => {
       `❌ ${mentionByProfile(user)}, ответьте на это сообщение комментарием (почему отклонено тикет ${st.ticket}).`,
       { reply_markup: { force_reply: true }, parse_mode: 'HTML' }
     );
-    pendingComments.set(`${chatId}:${userId}`, { messageId: prompt.message_id, ticketMsgId: msgId });
+    pendingComments.set(`${chatId}:${userId}`, { promptMsgId: prompt.message_id, ticketMsgId: msgId });
 
     await bot.editMessageText(
       `❌ Тикет ${st.ticket} отклонён. Ожидаю комментарий от ${mentionByProfile(user)}.`,
@@ -318,25 +331,32 @@ bot.on('callback_query', async (query) => {
   }
 });
 
-// ---------- 9) Комментарий к отказу ----------
+// ---------- 9) Комментарий к отказу (без дублирования) ----------
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const key = `${chatId}:${msg.from.id}`;
   const wait = pendingComments.get(key);
   if (!wait) return;
-  if (!msg.reply_to_message || msg.reply_to_message.message_id !== wait.messageId) return;
+
+  if (!msg.reply_to_message || msg.reply_to_message.message_id !== wait.promptMsgId) return;
 
   const st = ticketsState.get(wait.ticketMsgId);
-  if (!st) return;
+  if (!st) {
+    pendingComments.delete(key);
+    return;
+  }
 
   st.rejectComment = (msg.text || '').trim();
   pendingComments.delete(key);
 
-  await bot.sendMessage(
-    chatId,
-    `📝 Комментарий к отказу по тикету ${st.ticket} от ${mentionByProfile(msg.from)}: ${st.rejectComment || '—'}`,
-    { parse_mode: 'HTML' }
+  await bot.editMessageText(
+    `❌ Тикет ${st.ticket} отклонён.\n<b>Комментарий:</b> ${st.rejectComment || '—'}\n<b>От:</b> ${mentionByProfile(msg.from)}`,
+    { chat_id: chatId, message_id: wait.ticketMsgId, parse_mode: 'HTML' }
   );
+
+  // опционально чистим подсказку и ответ (бот должен быть админом с правом удаления)
+  try { await bot.deleteMessage(chatId, wait.promptMsgId); } catch (e) {}
+  try { await bot.deleteMessage(chatId, msg.message_id); } catch (e) {}
 });
 
 // ---------- 10) /stats — сводка ----------
@@ -430,7 +450,7 @@ bot.onText(/^\/stats(?:@[\w_]+)?(?:\s+(\d{4}-\d{2}))?$/i, async (msg, match) => 
   }
 });
 
-// ---------- 11) Диагностика: /gs-check ----------
+// ---------- 11) Диагностика (по желанию) ----------
 bot.onText(/^\/gs-check(?:@[\w_]+)?$/i, async (msg) => {
   const chatId = msg.chat.id;
   try {
@@ -457,29 +477,6 @@ bot.onText(/^\/gs-check(?:@[\w_]+)?$/i, async (msg) => {
   } catch (e) {
     console.error('gs-check error:', e);
     await bot.sendMessage(chatId, `⚠️ Ошибка подключения к таблице: ${e.message || e}`);
-  }
-});
-
-// ---------- 12) Диагностика: /gs-test ----------
-bot.onText(/^\/gs-test(?:@[\w_]+)?$/i, async (msg) => {
-  const chatId = msg.chat.id;
-  try {
-    const sheet = await getOrCreateMonthlySheet();
-    await ensureHeaders(sheet);
-    await sheet.addRow({
-      'Тикет': 'TEST-ROW',
-      'Тип нарушения': 'тест',
-      'Основание для аннулирования': 'проверка записи',
-      'Сумма': '0',
-      'Оператор': 'bot',
-      'Статус согласования': 'Одобрено',
-      'Кто подтвердил': 'system',
-      'Дата внесения': nowHelsinkiString()
-    });
-    await bot.sendMessage(chatId, `✅ Тестовая строка записана в лист «${monthSheetName()}». Проверь в таблице.`);
-  } catch (e) {
-    console.error('gs-test addRow error:', e);
-    await bot.sendMessage(chatId, `⚠️ Не удалось записать тестовую строку: ${e.message || e}`);
   }
 });
 // ===================== end of file =====================
